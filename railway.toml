@@ -1,0 +1,7 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python scripts/enhanced_collector.py --interval 500"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
