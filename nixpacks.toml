@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["python311"]
+nixPkgs = ["python311Full"]
 
 [phases.install]
-cmds = ["pip install -e ."]
+cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "python scripts/enhanced_collector.py --interval 500 --output /app/data/prices.csv"
+cmd = "python scripts/enhanced_collector.py --interval 500"
