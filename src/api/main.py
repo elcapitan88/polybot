@@ -1,5 +1,7 @@
-"""FastAPI application for Polymarket data dashboard."""
+"""FastAPI application for Polymarket data dashboard with integrated collector."""
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Query
@@ -14,8 +16,36 @@ from src.config import config
 from src.models.database import (
     PriceTick, MarketSession, ArbitrageOpportunity, CheapPrice, CollectorStats
 )
+from src.clients.polymarket import PolymarketClient, Market, MarketPrices
+from src.storage.postgres import PostgresStorage
 
-app = FastAPI(title="Polymarket Dashboard API", version="1.0.0")
+# Global collector state
+collector_task = None
+collector_running = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start collector on startup, stop on shutdown."""
+    global collector_task, collector_running
+
+    print("Starting integrated collector...")
+    collector_running = True
+    collector_task = asyncio.create_task(run_collector())
+
+    yield
+
+    print("Stopping collector...")
+    collector_running = False
+    if collector_task:
+        collector_task.cancel()
+        try:
+            await collector_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Polymarket Dashboard API", version="1.0.0", lifespan=lifespan)
 
 # CORS for development
 app.add_middleware(
@@ -34,6 +64,161 @@ SessionLocal = sessionmaker(bind=engine)
 frontend_path = Path(__file__).parent.parent.parent / "frontend"
 if frontend_path.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_path)), name="static")
+
+
+# ============================================================================
+# INTEGRATED COLLECTOR
+# ============================================================================
+
+class CollectorState:
+    """Track collector statistics."""
+    def __init__(self):
+        self.total_scans = 0
+        self.total_opportunities = 0
+        self.total_cheap_prices = 0
+        self.start_time = None
+        self.last_scan_time = None
+        self.active_markets = 0
+
+
+collector_state = CollectorState()
+
+
+async def run_collector():
+    """Background collector that runs alongside the API."""
+    global collector_running
+
+    # Collector settings
+    interval_ms = 500
+    cheap_threshold = 0.45
+    arbitrage_threshold = 0.025
+    batch_size = 50
+
+    client = PolymarketClient(mode="read")
+    storage = PostgresStorage(config.database_url)
+
+    collector_state.start_time = datetime.utcnow()
+    pending_writes = 0
+
+    # Start collector run in database
+    run_id = storage.start_collector_run(
+        interval_ms=interval_ms,
+        cheap_threshold=cheap_threshold,
+        arbitrage_threshold=arbitrage_threshold
+    )
+
+    print(f"Collector started - scanning every {interval_ms}ms")
+
+    while collector_running:
+        try:
+            # Get all market prices
+            all_prices = client.get_all_market_prices()
+            collector_state.active_markets = len(all_prices)
+            collector_state.last_scan_time = datetime.utcnow()
+
+            for market, prices in all_prices:
+                is_cheap_yes = prices.yes_ask and prices.yes_ask < cheap_threshold
+                is_cheap_no = prices.no_ask and prices.no_ask < cheap_threshold
+
+                if is_cheap_yes or is_cheap_no:
+                    collector_state.total_cheap_prices += 1
+
+                # Log tick
+                storage.log_tick(
+                    timestamp=prices.timestamp,
+                    market_id=market.condition_id,
+                    asset=market.asset,
+                    question=market.question[:100] if market.question else "",
+                    yes_ask=prices.yes_ask,
+                    no_ask=prices.no_ask,
+                    combined_cost=prices.combined_ask,
+                    profit_pct=prices.arbitrage_profit_pct,
+                    yes_liquidity=prices.yes_liquidity,
+                    no_liquidity=prices.no_liquidity,
+                    has_arbitrage=prices.has_arbitrage,
+                    is_cheap_yes=is_cheap_yes,
+                    is_cheap_no=is_cheap_no
+                )
+                pending_writes += 1
+
+                # Log cheap prices
+                if is_cheap_yes:
+                    storage.log_cheap_price(
+                        timestamp=prices.timestamp,
+                        market_id=market.condition_id,
+                        asset=market.asset,
+                        side="YES",
+                        price=prices.yes_ask,
+                        threshold=cheap_threshold,
+                        liquidity=prices.yes_liquidity
+                    )
+                    pending_writes += 1
+
+                if is_cheap_no:
+                    storage.log_cheap_price(
+                        timestamp=prices.timestamp,
+                        market_id=market.condition_id,
+                        asset=market.asset,
+                        side="NO",
+                        price=prices.no_ask,
+                        threshold=cheap_threshold,
+                        liquidity=prices.no_liquidity
+                    )
+                    pending_writes += 1
+
+                # Log arbitrage opportunities
+                if prices.has_arbitrage and prices.arbitrage_profit_pct >= arbitrage_threshold:
+                    max_profit = 0.0
+                    if prices.combined_ask:
+                        max_profit = min(prices.yes_liquidity, prices.no_liquidity) * (1.0 - prices.combined_ask)
+
+                    storage.log_opportunity(
+                        timestamp=prices.timestamp,
+                        market_id=market.condition_id,
+                        asset=market.asset,
+                        question=market.question,
+                        yes_ask=prices.yes_ask,
+                        no_ask=prices.no_ask,
+                        combined_cost=prices.combined_ask,
+                        profit_pct=prices.arbitrage_profit_pct,
+                        yes_liquidity=prices.yes_liquidity,
+                        no_liquidity=prices.no_liquidity,
+                        max_profit_usd=max_profit
+                    )
+                    collector_state.total_opportunities += 1
+                    pending_writes += 1
+
+            collector_state.total_scans += 1
+
+            # Commit batch
+            if pending_writes >= batch_size:
+                storage.commit()
+                pending_writes = 0
+
+            await asyncio.sleep(interval_ms / 1000.0)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Collector error: {e}")
+            await asyncio.sleep(5)
+
+    # Final commit and cleanup
+    if pending_writes > 0:
+        storage.commit()
+
+    if run_id:
+        storage.update_collector_stats(
+            run_id=run_id,
+            total_scans=collector_state.total_scans,
+            total_opportunities=collector_state.total_opportunities,
+            total_cheap_prices=collector_state.total_cheap_prices,
+            total_sessions=0
+        )
+        storage.commit()
+
+    storage.close()
+    print("Collector stopped")
 
 
 @app.get("/")
@@ -63,11 +248,6 @@ async def get_stats():
         yes_up_count = sum(1 for s in sessions_with_data if s.yes_closed_above_open)
         no_down_count = sum(1 for s in sessions_with_data if s.no_closed_below_open)
 
-        # Recent collector run
-        latest_run = session.query(CollectorStats).order_by(
-            desc(CollectorStats.start_time)
-        ).first()
-
         # Latest tick timestamp
         latest_tick = session.query(PriceTick).order_by(
             desc(PriceTick.timestamp)
@@ -83,8 +263,11 @@ async def get_stats():
             "no_closed_below_open": no_down_count,
             "yes_up_pct": round(yes_up_count / len(sessions_with_data) * 100, 1) if sessions_with_data else 0,
             "no_down_pct": round(no_down_count / len(sessions_with_data) * 100, 1) if sessions_with_data else 0,
-            "collector_running": latest_run is not None and latest_run.end_time is None if latest_run else False,
+            "collector_running": collector_running,
+            "collector_scans": collector_state.total_scans,
+            "collector_active_markets": collector_state.active_markets,
             "last_tick": latest_tick.timestamp.isoformat() if latest_tick else None,
+            "last_scan": collector_state.last_scan_time.isoformat() if collector_state.last_scan_time else None,
         }
     finally:
         session.close()
