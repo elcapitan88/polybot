@@ -2,6 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python scripts/enhanced_collector.py --interval 500"
+startCommand = "uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8080}"
 restartPolicyType = "always"
 restartPolicyMaxRetries = 10
