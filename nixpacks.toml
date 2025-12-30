@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python311Full"]
-
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[start]
-cmd = "python scripts/enhanced_collector.py --interval 500"
