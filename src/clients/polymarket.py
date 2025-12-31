@@ -26,20 +26,31 @@ class MarketPrices:
     no_liquidity: float
     timestamp: datetime
 
-    # Minimum tick on Polymarket is $0.02 - prices at this level with no liquidity are fake
+    # Minimum tick on Polymarket is $0.02 - prices at this level are placeholder/fake
     MIN_TICK = 0.02
     # Minimum liquidity to consider a price valid (in shares/USD)
     MIN_LIQUIDITY = 10.0
+    # Minimum combined cost - anything below this is fake (no real 50%+ arbitrage exists)
+    MIN_COMBINED_COST = 0.90
 
     @property
     def has_valid_prices(self) -> bool:
-        """Check if prices are real (not just minimum tick with no liquidity)."""
-        # If both prices are at minimum tick, check liquidity
-        if self.yes_ask == self.MIN_TICK and self.no_ask == self.MIN_TICK:
-            # Need actual liquidity on both sides
-            return self.yes_liquidity >= self.MIN_LIQUIDITY and self.no_liquidity >= self.MIN_LIQUIDITY
-        # If either price is above minimum tick, it's likely real
-        return self.yes_ask is not None and self.no_ask is not None
+        """Check if prices are real (not placeholder prices from inactive markets)."""
+        if self.yes_ask is None or self.no_ask is None:
+            return False
+
+        combined = self.yes_ask + self.no_ask
+
+        # Combined cost < $0.90 is impossible in real markets - would be instantly arbed
+        # This catches fake $0.02/$0.02 = $0.04 prices from pre-trading markets
+        if combined < self.MIN_COMBINED_COST:
+            return False
+
+        # If both at min tick even with "realistic" combined, still suspicious
+        if self.yes_ask <= self.MIN_TICK or self.no_ask <= self.MIN_TICK:
+            return False
+
+        return True
 
     @property
     def combined_ask(self) -> Optional[float]:
