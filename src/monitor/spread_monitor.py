@@ -573,12 +573,17 @@ class SpreadMonitor:
             try:
                 now = datetime.now(timezone.utc)
                 if (now - self._last_market_refresh).total_seconds() >= self.MARKET_REFRESH_INTERVAL:
-                    old_count = len(self._markets)
-                    await self._refresh_markets()
-                    new_count = len(self._markets)
+                    # Track old token IDs to detect changes
+                    old_tokens = set(self._token_to_market.keys())
 
-                    # Resubscribe if markets changed
-                    if new_count != old_count and self._ws:
+                    await self._refresh_markets()
+
+                    # Get new token IDs
+                    new_tokens = set(self._token_to_market.keys())
+
+                    # Resubscribe if tokens changed (not just count!)
+                    if old_tokens != new_tokens and self._ws:
+                        print(f"[Monitor] Tokens changed! Resubscribing to {len(new_tokens)} tokens...")
                         await self._subscribe_all_tokens()
 
                     self._last_market_refresh = now
