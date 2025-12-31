@@ -47,11 +47,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Polymarket Dashboard API", version="1.0.0", lifespan=lifespan)
 
-# CORS for development
+# CORS - allow all origins for dashboard access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
