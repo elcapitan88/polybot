@@ -763,7 +763,7 @@ class SpreadMonitor:
             "snapshots_recorded": self._snapshots_recorded,
             "opportunities_detected": self._opportunities_detected,
             "active_opportunities": active_opps,
-            "trading_hours": "6 PM - 12 AM EST (approx)",
+            "trading_hours": "6:15 PM - 1:15 AM EST",
         }
 
     def get_current_spreads(self) -> list[dict]:
