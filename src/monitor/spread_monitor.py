@@ -1,22 +1,28 @@
 """
 Spread Monitor for Polymarket Delta-Neutral Strategy.
 
-Monitors 15m crypto markets and detects when combined UP + DOWN < $1.00.
-Uses last-trade-price polling for accurate pricing.
+Monitors 15m crypto markets via WebSocket and detects when combined UP + DOWN < $1.00.
+Uses real-time order book updates from the CLOB WebSocket API.
 """
 
 import asyncio
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import httpx
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 from src.config import config
 from src.models.database import (
     init_db, SpreadSnapshot, Opportunity, MarketWindow,
     DailyStats, MonitorStatus
 )
+
+
+# WebSocket endpoint for Polymarket CLOB
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 @dataclass
@@ -30,9 +36,13 @@ class MarketState:
     up_token: str
     down_token: str
 
-    # Current prices (last trade prices)
-    up_price: Optional[float] = None
-    down_price: Optional[float] = None
+    # Current best ask prices (what we'd pay to buy)
+    up_ask: Optional[float] = None
+    down_ask: Optional[float] = None
+
+    # Available liquidity at best ask
+    up_liquidity: float = 0.0
+    down_liquidity: float = 0.0
 
     # Timestamps
     up_updated: Optional[datetime] = None
@@ -45,8 +55,8 @@ class MarketState:
     @property
     def combined(self) -> Optional[float]:
         """Combined cost to buy both sides."""
-        if self.up_price and self.down_price:
-            return self.up_price + self.down_price
+        if self.up_ask and self.down_ask:
+            return self.up_ask + self.down_ask
         return None
 
     @property
@@ -71,34 +81,39 @@ class MarketState:
     @property
     def has_valid_prices(self) -> bool:
         """Check if we have valid prices on both sides."""
-        if self.up_price is None or self.down_price is None:
+        if self.up_ask is None or self.down_ask is None:
             return False
-        # Filter out extreme prices
-        if self.up_price <= 0.01 or self.down_price <= 0.01:
+        # Filter out extreme prices (likely no real liquidity)
+        if self.up_ask <= 0.01 or self.down_ask <= 0.01:
             return False
-        if self.up_price >= 0.99 or self.down_price >= 0.99:
+        if self.up_ask >= 0.99 or self.down_ask >= 0.99:
             return False
         return True
+
+    @property
+    def max_position(self) -> float:
+        """Maximum position size limited by liquidity on both sides."""
+        return min(self.up_liquidity, self.down_liquidity)
 
 
 class SpreadMonitor:
     """
-    Main monitoring system for Polymarket spreads.
+    Main monitoring system for Polymarket spreads via WebSocket.
 
-    - Discovers active 15m crypto markets
-    - Polls last-trade-price for real pricing
+    - Discovers active 15m crypto markets via REST API
+    - Connects to WebSocket for real-time order book updates
     - Detects and records opportunities (combined < $1.00)
     - Stores snapshots for historical analysis
     """
-
-    # How often to poll prices (seconds)
-    POLL_INTERVAL = 1.0
 
     # How often to take snapshots (seconds)
     SNAPSHOT_INTERVAL = 30
 
     # How often to refresh market list (seconds)
     MARKET_REFRESH_INTERVAL = 60
+
+    # WebSocket ping interval (seconds)
+    WS_PING_INTERVAL = 10
 
     # Minimum spread to consider an opportunity (avoid noise)
     MIN_SPREAD_PCT = 0.5  # 0.5%
@@ -110,9 +125,13 @@ class SpreadMonitor:
 
         # Market state tracking
         self._markets: dict[str, MarketState] = {}  # market_id -> state
+        self._token_to_market: dict[str, tuple[str, str]] = {}  # token_id -> (market_id, side)
 
-        # HTTP client
+        # HTTP client for market discovery
         self._http: Optional[httpx.AsyncClient] = None
+
+        # WebSocket connection
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
 
         # State
         self._running = False
@@ -123,20 +142,20 @@ class SpreadMonitor:
         # Stats
         self._snapshots_recorded = 0
         self._opportunities_detected = 0
-        self._polls_completed = 0
+        self._messages_received = 0
 
     async def start(self):
         """Start the spread monitor."""
-        print("[Monitor] Starting spread monitor...")
+        print("[Monitor] Starting spread monitor with WebSocket...")
         self._running = True
         self._http = httpx.AsyncClient(timeout=30)
 
         # Initial market discovery
         await self._refresh_markets()
 
-        # Start tasks
+        # Start background tasks
         await asyncio.gather(
-            self._price_poll_loop(),
+            self._websocket_loop(),
             self._market_refresh_loop(),
             self._snapshot_loop(),
             return_exceptions=True,
@@ -147,64 +166,217 @@ class SpreadMonitor:
         print("[Monitor] Stopping...")
         self._running = False
 
+        if self._ws:
+            await self._ws.close()
         if self._http:
             await self._http.aclose()
         print("[Monitor] Stopped")
 
-    async def _price_poll_loop(self):
-        """Continuously poll prices for all markets."""
+    async def _websocket_loop(self):
+        """Main WebSocket connection loop with auto-reconnect."""
         while self._running:
             try:
-                await self._poll_all_prices()
-                self._polls_completed += 1
-                self._connected = True
+                await self._connect_and_listen()
+            except ConnectionClosed as e:
+                print(f"[WS] Connection closed: {e}")
+                self._connected = False
             except Exception as e:
-                print(f"[Monitor] Poll error: {e}")
+                print(f"[WS] Error: {e}")
                 self._connected = False
 
-            await asyncio.sleep(self.POLL_INTERVAL)
+            if self._running:
+                print("[WS] Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
 
-    async def _poll_all_prices(self):
-        """Poll last-trade-price for all tracked markets."""
-        if not self._markets or not self._http:
+    async def _connect_and_listen(self):
+        """Connect to WebSocket and listen for messages."""
+        print(f"[WS] Connecting to {WS_URL}...")
+
+        async with websockets.connect(WS_URL, ping_interval=None) as ws:
+            self._ws = ws
+            self._connected = True
+            print("[WS] Connected!")
+
+            # Subscribe to all tracked tokens
+            await self._subscribe_all_tokens()
+
+            # Start ping task
+            ping_task = asyncio.create_task(self._ping_loop())
+
+            try:
+                async for message in ws:
+                    await self._handle_message(message)
+            finally:
+                ping_task.cancel()
+
+    async def _ping_loop(self):
+        """Send PING messages to keep connection alive."""
+        while self._running and self._ws:
+            try:
+                await asyncio.sleep(self.WS_PING_INTERVAL)
+                if self._ws and self._ws.open:
+                    await self._ws.send("PING")
+            except Exception as e:
+                print(f"[WS] Ping error: {e}")
+                break
+
+    async def _subscribe_all_tokens(self):
+        """Subscribe to all tracked token IDs."""
+        if not self._ws or not self._markets:
             return
 
-        now = datetime.now(timezone.utc)
-
-        # Poll all tokens concurrently
-        tasks = []
+        # Collect all token IDs
+        asset_ids = []
         for market in self._markets.values():
-            tasks.append(self._poll_token_price(market.up_token, market, "up"))
-            tasks.append(self._poll_token_price(market.down_token, market, "down"))
+            asset_ids.append(market.up_token)
+            asset_ids.append(market.down_token)
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not asset_ids:
+            print("[WS] No tokens to subscribe to")
+            return
 
-        # Check for opportunities
-        for market in self._markets.values():
+        # Send subscription message
+        subscribe_msg = {
+            "assets_ids": asset_ids,
+            "type": "market"
+        }
+
+        await self._ws.send(json.dumps(subscribe_msg))
+        print(f"[WS] Subscribed to {len(asset_ids)} tokens ({len(self._markets)} markets)")
+
+    async def _handle_message(self, raw_message: str):
+        """Handle incoming WebSocket message."""
+        if raw_message == "PONG":
+            return
+
+        self._messages_received += 1
+
+        try:
+            # Messages can be arrays
+            messages = json.loads(raw_message)
+            if not isinstance(messages, list):
+                messages = [messages]
+
+            for msg in messages:
+                event_type = msg.get("event_type")
+
+                if event_type == "book":
+                    await self._handle_book_message(msg)
+                elif event_type == "price_change":
+                    await self._handle_price_change(msg)
+                elif event_type == "last_trade_price":
+                    await self._handle_last_trade(msg)
+
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            print(f"[WS] Message handling error: {e}")
+
+    async def _handle_book_message(self, msg: dict):
+        """Handle full order book update."""
+        asset_id = msg.get("asset_id")
+        if not asset_id:
+            return
+
+        market_info = self._token_to_market.get(asset_id)
+        if not market_info:
+            return
+
+        market_id, side = market_info
+        market = self._markets.get(market_id)
+        if not market:
+            return
+
+        # Get best ask (lowest sell price) from sells array
+        sells = msg.get("sells", [])
+        if sells:
+            # Sells are typically sorted by price ascending
+            best_ask = float(sells[0].get("price", 0))
+            best_ask_size = float(sells[0].get("size", 0))
+
+            now = datetime.now(timezone.utc)
+
+            if side == "up":
+                market.up_ask = best_ask
+                market.up_liquidity = best_ask_size
+                market.up_updated = now
+            else:
+                market.down_ask = best_ask
+                market.down_liquidity = best_ask_size
+                market.down_updated = now
+
+            # Check for opportunities
             self._check_opportunity(market)
 
-    async def _poll_token_price(self, token_id: str, market: MarketState, side: str):
-        """Poll price for a single token."""
-        try:
-            response = await self._http.get(
-                f"{config.clob_host}/last-trade-price",
-                params={"token_id": token_id}
-            )
+            # Log periodically
+            if self._messages_received % 100 == 0:
+                print(f"[WS] {market.asset} | UP=${market.up_ask or 0:.3f} DOWN=${market.down_ask or 0:.3f} | "
+                      f"Combined=${market.combined or 0:.3f}")
 
-            if response.status_code == 200:
-                data = response.json()
-                price = float(data.get("price", 0))
+    async def _handle_price_change(self, msg: dict):
+        """Handle price change update."""
+        # Price changes include best bid/ask updates
+        changes = msg.get("changes", [])
+        for change in changes:
+            asset_id = change.get("asset_id")
+            if not asset_id:
+                continue
+
+            market_info = self._token_to_market.get(asset_id)
+            if not market_info:
+                continue
+
+            market_id, side = market_info
+            market = self._markets.get(market_id)
+            if not market:
+                continue
+
+            # Check if this is an ask (sell) side update
+            if change.get("side") == "SELL":
+                price = float(change.get("price", 0))
+                size = float(change.get("size", 0))
                 now = datetime.now(timezone.utc)
 
+                # Only update if this could be the new best ask
+                # (We'd need the full book to know for sure, but we can use this as a hint)
                 if side == "up":
-                    market.up_price = price
-                    market.up_updated = now
+                    if market.up_ask is None or price <= market.up_ask:
+                        market.up_ask = price
+                        market.up_liquidity = size
+                        market.up_updated = now
                 else:
-                    market.down_price = price
-                    market.down_updated = now
+                    if market.down_ask is None or price <= market.down_ask:
+                        market.down_ask = price
+                        market.down_liquidity = size
+                        market.down_updated = now
 
-        except Exception as e:
-            pass  # Silently ignore individual poll failures
+                self._check_opportunity(market)
+
+    async def _handle_last_trade(self, msg: dict):
+        """Handle last trade price update."""
+        asset_id = msg.get("asset_id")
+        if not asset_id:
+            return
+
+        market_info = self._token_to_market.get(asset_id)
+        if not market_info:
+            return
+
+        market_id, side = market_info
+        market = self._markets.get(market_id)
+        if not market:
+            return
+
+        price = float(msg.get("price", 0))
+        now = datetime.now(timezone.utc)
+
+        # Last trade price can be used as a reference if we don't have book data
+        if side == "up" and market.up_ask is None:
+            market.up_ask = price
+            market.up_updated = now
+        elif side == "down" and market.down_ask is None:
+            market.down_ask = price
+            market.down_updated = now
 
     def _check_opportunity(self, market: MarketState):
         """Check if market has an opportunity and handle it."""
@@ -251,22 +423,26 @@ class SpreadMonitor:
                 detected_at=now,
                 asset=market.asset,
                 market_id=market.market_id,
-                up_ask=market.up_price,
-                down_ask=market.down_price,
+                up_ask=market.up_ask,
+                down_ask=market.down_ask,
                 combined=market.combined,
                 spread=market.spread or 0,
                 spread_pct=market.spread_pct or 0,
-                up_liquidity=0,
-                down_liquidity=0,
-                max_position=0,
+                up_liquidity=market.up_liquidity,
+                down_liquidity=market.down_liquidity,
+                max_position=market.max_position,
             )
             session.add(opp)
             session.commit()
 
-            print(f"[OPPORTUNITY] {market.asset} | "
-                  f"UP=${market.up_price:.3f} + DOWN=${market.down_price:.3f} = "
-                  f"${market.combined:.3f} | "
-                  f"Spread: {market.spread_pct:.2f}%")
+            print(f"\n{'='*60}")
+            print(f"[OPPORTUNITY DETECTED] {market.asset}")
+            print(f"  UP Ask:    ${market.up_ask:.4f} (${market.up_liquidity:.0f} available)")
+            print(f"  DOWN Ask:  ${market.down_ask:.4f} (${market.down_liquidity:.0f} available)")
+            print(f"  Combined:  ${market.combined:.4f}")
+            print(f"  Spread:    {market.spread_pct:.2f}%")
+            print(f"  Max Size:  ${market.max_position:.0f}")
+            print(f"{'='*60}\n")
 
         except Exception as e:
             print(f"[Monitor] DB error logging opportunity: {e}")
@@ -318,7 +494,14 @@ class SpreadMonitor:
             try:
                 now = datetime.now(timezone.utc)
                 if (now - self._last_market_refresh).total_seconds() >= self.MARKET_REFRESH_INTERVAL:
+                    old_count = len(self._markets)
                     await self._refresh_markets()
+                    new_count = len(self._markets)
+
+                    # Resubscribe if markets changed
+                    if new_count != old_count and self._ws and self._ws.open:
+                        await self._subscribe_all_tokens()
+
                     self._last_market_refresh = now
             except Exception as e:
                 print(f"[Monitor] Market refresh error: {e}")
@@ -348,6 +531,7 @@ class SpreadMonitor:
             return
 
         seen_market_ids = set()
+        new_token_map = {}
 
         for event in events:
             slug = (event.get("slug", "") or "").lower()
@@ -390,6 +574,10 @@ class SpreadMonitor:
                 up_token = clob_ids[0]
                 down_token = clob_ids[1]
 
+                # Build token -> market mapping
+                new_token_map[up_token] = (market_id, "up")
+                new_token_map[down_token] = (market_id, "down")
+
                 # Create or update market state
                 if market_id not in self._markets:
                     self._markets[market_id] = MarketState(
@@ -400,12 +588,15 @@ class SpreadMonitor:
                         down_token=down_token,
                     )
 
+        # Update token map
+        self._token_to_market = new_token_map
+
         # Remove stale markets
         stale = [mid for mid in self._markets if mid not in seen_market_ids]
         for mid in stale:
             self._markets.pop(mid, None)
 
-        print(f"[Monitor] Active 15m markets: {len(self._markets)}")
+        print(f"[Monitor] Active 15m markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
 
     async def _snapshot_loop(self):
         """Periodically save snapshots of all market spreads."""
@@ -438,12 +629,12 @@ class SpreadMonitor:
                     timestamp=now,
                     asset=market.asset,
                     market_id=market.market_id,
-                    up_ask=market.up_price,
-                    down_ask=market.down_price,
+                    up_ask=market.up_ask,
+                    down_ask=market.down_ask,
                     combined=market.combined,
                     spread=market.spread,
-                    up_liquidity=0,
-                    down_liquidity=0,
+                    up_liquidity=market.up_liquidity,
+                    down_liquidity=market.down_liquidity,
                     has_opportunity=market.has_opportunity,
                 )
                 session.add(snapshot)
@@ -469,7 +660,7 @@ class SpreadMonitor:
             "running": self._running,
             "connected": self._connected,
             "markets_tracked": len(self._markets),
-            "polls_completed": self._polls_completed,
+            "messages_received": self._messages_received,
             "snapshots_recorded": self._snapshots_recorded,
             "opportunities_detected": self._opportunities_detected,
             "active_opportunities": active_opps,
@@ -486,12 +677,15 @@ class SpreadMonitor:
             spreads.append({
                 "asset": market.asset,
                 "timeframe": market.timeframe,
-                "up_price": market.up_price,
-                "down_price": market.down_price,
+                "up_price": market.up_ask,
+                "down_price": market.down_ask,
+                "up_liquidity": market.up_liquidity,
+                "down_liquidity": market.down_liquidity,
                 "combined": market.combined,
                 "spread": market.spread,
                 "spread_pct": market.spread_pct,
                 "has_opportunity": market.has_opportunity,
+                "max_position": market.max_position,
             })
 
         # Sort by spread descending
