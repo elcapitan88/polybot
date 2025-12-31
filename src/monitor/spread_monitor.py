@@ -7,7 +7,7 @@ Uses real-time order book updates from the CLOB WebSocket API.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
 import httpx
@@ -110,7 +110,8 @@ class SpreadMonitor:
     SNAPSHOT_INTERVAL = 30
 
     # How often to refresh market list (seconds)
-    MARKET_REFRESH_INTERVAL = 60
+    # More frequent since we need to switch markets every 15 minutes
+    MARKET_REFRESH_INTERVAL = 30
 
     # WebSocket ping interval (seconds)
     WS_PING_INTERVAL = 10
@@ -508,8 +509,33 @@ class SpreadMonitor:
 
             await asyncio.sleep(5)
 
+    def _get_next_resolution_time(self) -> datetime:
+        """Get the next 15-minute resolution timestamp."""
+        now = datetime.now(timezone.utc)
+        # Round up to next 15-minute mark
+        minutes = now.minute
+        next_quarter = ((minutes // 15) + 1) * 15
+        if next_quarter >= 60:
+            next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:
+            next_time = now.replace(minute=next_quarter, second=0, microsecond=0)
+        return next_time
+
+    def _extract_resolution_timestamp(self, slug: str) -> Optional[int]:
+        """Extract Unix timestamp from market slug like 'btc-updown-15m-1767242700'."""
+        try:
+            parts = slug.split("-")
+            # Last part should be the timestamp
+            timestamp = int(parts[-1])
+            # Sanity check: should be a reasonable Unix timestamp (after 2020)
+            if timestamp > 1577836800:  # Jan 1, 2020
+                return timestamp
+        except (ValueError, IndexError):
+            pass
+        return None
+
     async def _refresh_markets(self):
-        """Fetch active 15m markets."""
+        """Fetch only the currently active 15m market for each asset."""
         print("[Monitor] Refreshing markets...")
 
         if not self._http:
@@ -530,8 +556,15 @@ class SpreadMonitor:
             print(f"[Monitor] Failed to fetch events: {e}")
             return
 
+        # Calculate the next resolution time
+        next_resolution = self._get_next_resolution_time()
+        next_resolution_ts = int(next_resolution.timestamp())
+
+        print(f"[Monitor] Looking for markets resolving at {next_resolution.strftime('%H:%M:%S')} UTC (ts={next_resolution_ts})")
+
         seen_market_ids = set()
         new_token_map = {}
+        active_by_asset = {}  # asset -> best matching market
 
         for event in events:
             slug = (event.get("slug", "") or "").lower()
@@ -540,6 +573,16 @@ class SpreadMonitor:
             if "-15m-" not in slug:
                 continue
             if not any(asset in slug for asset in ["btc", "eth", "xrp", "sol"]):
+                continue
+
+            # Extract resolution timestamp from slug
+            resolution_ts = self._extract_resolution_timestamp(slug)
+            if resolution_ts is None:
+                continue
+
+            # Only include markets that resolve at the next 15-minute mark
+            # Allow a small tolerance (within 60 seconds)
+            if abs(resolution_ts - next_resolution_ts) > 60:
                 continue
 
             # Extract asset
@@ -574,29 +617,47 @@ class SpreadMonitor:
                 up_token = clob_ids[0]
                 down_token = clob_ids[1]
 
-                # Build token -> market mapping
-                new_token_map[up_token] = (market_id, "up")
-                new_token_map[down_token] = (market_id, "down")
+                # Store this as the active market for this asset
+                active_by_asset[asset] = {
+                    "market_id": market_id,
+                    "up_token": up_token,
+                    "down_token": down_token,
+                    "resolution_ts": resolution_ts,
+                }
 
-                # Create or update market state
-                if market_id not in self._markets:
-                    self._markets[market_id] = MarketState(
-                        asset=asset,
-                        market_id=market_id,
-                        timeframe="15m",
-                        up_token=up_token,
-                        down_token=down_token,
-                    )
+        # Build the final market list from active markets only
+        final_market_ids = set()
+        for asset, market_info in active_by_asset.items():
+            market_id = market_info["market_id"]
+            up_token = market_info["up_token"]
+            down_token = market_info["down_token"]
+
+            final_market_ids.add(market_id)
+            new_token_map[up_token] = (market_id, "up")
+            new_token_map[down_token] = (market_id, "down")
+
+            # Create or update market state
+            if market_id not in self._markets:
+                self._markets[market_id] = MarketState(
+                    asset=asset,
+                    market_id=market_id,
+                    timeframe="15m",
+                    up_token=up_token,
+                    down_token=down_token,
+                )
+
+            resolution_time = datetime.fromtimestamp(market_info["resolution_ts"], tz=timezone.utc)
+            print(f"[Monitor] {asset}: Tracking market resolving at {resolution_time.strftime('%H:%M:%S')} UTC")
 
         # Update token map
         self._token_to_market = new_token_map
 
-        # Remove stale markets
-        stale = [mid for mid in self._markets if mid not in seen_market_ids]
+        # Remove stale markets (not in the active set)
+        stale = [mid for mid in self._markets if mid not in final_market_ids]
         for mid in stale:
             self._markets.pop(mid, None)
 
-        print(f"[Monitor] Active 15m markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
+        print(f"[Monitor] Active markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
 
     async def _snapshot_loop(self):
         """Periodically save snapshots of all market spreads."""
