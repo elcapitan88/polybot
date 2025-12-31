@@ -26,6 +26,21 @@ class MarketPrices:
     no_liquidity: float
     timestamp: datetime
 
+    # Minimum tick on Polymarket is $0.02 - prices at this level with no liquidity are fake
+    MIN_TICK = 0.02
+    # Minimum liquidity to consider a price valid (in shares/USD)
+    MIN_LIQUIDITY = 10.0
+
+    @property
+    def has_valid_prices(self) -> bool:
+        """Check if prices are real (not just minimum tick with no liquidity)."""
+        # If both prices are at minimum tick, check liquidity
+        if self.yes_ask == self.MIN_TICK and self.no_ask == self.MIN_TICK:
+            # Need actual liquidity on both sides
+            return self.yes_liquidity >= self.MIN_LIQUIDITY and self.no_liquidity >= self.MIN_LIQUIDITY
+        # If either price is above minimum tick, it's likely real
+        return self.yes_ask is not None and self.no_ask is not None
+
     @property
     def combined_ask(self) -> Optional[float]:
         """Combined cost to buy both sides."""
@@ -43,8 +58,15 @@ class MarketPrices:
 
     @property
     def has_arbitrage(self) -> bool:
-        """Check if arbitrage opportunity exists."""
-        return self.combined_ask is not None and self.combined_ask < 1.0
+        """Check if REAL arbitrage opportunity exists (not fake min-tick prices)."""
+        if not self.has_valid_prices:
+            return False
+        if self.combined_ask is None or self.combined_ask >= 1.0:
+            return False
+        # Must have minimum liquidity on both sides to actually trade
+        if self.yes_liquidity < self.MIN_LIQUIDITY or self.no_liquidity < self.MIN_LIQUIDITY:
+            return False
+        return True
 
 
 @dataclass
@@ -139,6 +161,10 @@ class PolymarketClient:
                     for market_data in event.get("markets", []):
                         # Skip closed markets
                         if market_data.get("closed"):
+                            continue
+
+                        # Skip markets not accepting orders (not in active trading window)
+                        if not market_data.get("acceptingOrders", False):
                             continue
 
                         # Parse clobTokenIds - comes as JSON string from API

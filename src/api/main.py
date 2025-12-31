@@ -117,6 +117,10 @@ async def run_collector():
             collector_state.last_scan_time = datetime.utcnow()
 
             for market, prices in all_prices:
+                # Skip invalid prices (fake $0.02 min-tick with no liquidity)
+                if not prices.has_valid_prices:
+                    continue
+
                 is_cheap_yes = prices.yes_ask and prices.yes_ask < cheap_threshold
                 is_cheap_no = prices.no_ask and prices.no_ask < cheap_threshold
 
@@ -302,7 +306,10 @@ async def get_opportunities(
                 "yes_ask": o.yes_ask,
                 "no_ask": o.no_ask,
                 "combined_cost": o.combined_cost,
+                "spread": round(1.0 - o.combined_cost, 4) if o.combined_cost else 0,
                 "profit_pct": round(o.profit_pct * 100, 2) if o.profit_pct else 0,
+                "yes_liquidity": o.yes_liquidity,
+                "no_liquidity": o.no_liquidity,
                 "max_profit_usd": round(o.max_profit_usd, 2) if o.max_profit_usd else 0,
             }
             for o in opportunities
