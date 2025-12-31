@@ -535,117 +535,84 @@ class SpreadMonitor:
         return None
 
     async def _refresh_markets(self):
-        """Fetch the nearest upcoming 15m market for each asset."""
+        """Fetch the current 15m market for each asset by calculating expected slugs."""
         print("[Monitor] Refreshing markets...")
 
         if not self._http:
             return
 
-        try:
-            response = await self._http.get(
-                f"{config.gamma_host}/events",
-                params={
-                    "limit": 500,
-                    "closed": "false",
-                    "order": "startDate",
-                    "ascending": "false",
-                }
-            )
-            events = response.json()
-        except Exception as e:
-            print(f"[Monitor] Failed to fetch events: {e}")
-            return
-
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        seen_market_ids = set()
+
+        # Calculate current and next 15-minute resolution timestamps
+        current_slot = now_ts - (now_ts % 900)  # Current 15-min slot
+        next_slot = current_slot + 900  # Next 15-min slot
+
+        # We want the market that resolves NEXT (that we can still trade)
+        # If we're more than 1 minute past a slot, use the next one
+        if now_ts - current_slot > 60:
+            target_slot = next_slot
+        else:
+            target_slot = current_slot
+
+        print(f"[Monitor] Target resolution: {datetime.fromtimestamp(target_slot, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
+
+        assets = ["btc", "eth", "sol", "xrp"]
         new_token_map = {}
-        # Track nearest upcoming market per asset
-        nearest_by_asset: dict[str, dict] = {}
-
-        # Debug counters
-        total_events = len(events) if isinstance(events, list) else 0
-        crypto_15m_count = 0
-        sample_slugs = []
-
-        print(f"[Monitor] Fetched {total_events} total events from gamma API")
-
-        for event in events:
-            slug = (event.get("slug", "") or "").lower()
-
-            # Collect sample slugs for debugging (first 10 that contain crypto keywords)
-            if any(asset in slug for asset in ["btc", "eth", "xrp", "sol", "crypto"]):
-                if len(sample_slugs) < 10:
-                    sample_slugs.append(slug[:80])
-
-            # Check for 15m markets - be more flexible with the pattern
-            is_15m = "15m" in slug or "15-min" in slug or "15min" in slug
-
-            if not is_15m:
-                continue
-
-            if not any(asset in slug for asset in ["btc", "eth", "xrp", "sol"]):
-                continue
-
-            crypto_15m_count += 1
-
-            # Extract resolution timestamp from slug
-            resolution_ts = self._extract_resolution_timestamp(slug)
-            if resolution_ts is None:
-                print(f"[Monitor] Could not parse timestamp from: {slug}")
-                continue
-
-            # Skip markets that resolved more than 5 minutes ago
-            if resolution_ts < now_ts - 300:
-                continue
-
-            # Extract asset
-            asset = "UNK"
-            for a in ["BTC", "ETH", "XRP", "SOL"]:
-                if a.lower() in slug:
-                    asset = a
-                    break
-
-            for market in event.get("markets", []):
-                if market.get("closed"):
-                    continue
-                if not market.get("acceptingOrders", False):
-                    continue
-
-                market_id = market.get("conditionId", "")
-                if not market_id or market_id in seen_market_ids:
-                    continue
-                seen_market_ids.add(market_id)
-
-                # Get token IDs
-                clob_ids = market.get("clobTokenIds")
-                if isinstance(clob_ids, str):
-                    try:
-                        clob_ids = json.loads(clob_ids)
-                    except:
-                        continue
-
-                if not clob_ids or len(clob_ids) < 2:
-                    continue
-
-                up_token = clob_ids[0]
-                down_token = clob_ids[1]
-
-                # Keep only the nearest (soonest resolving) market per asset
-                if asset not in nearest_by_asset or resolution_ts < nearest_by_asset[asset]["resolution_ts"]:
-                    nearest_by_asset[asset] = {
-                        "market_id": market_id,
-                        "up_token": up_token,
-                        "down_token": down_token,
-                        "resolution_ts": resolution_ts,
-                        "slug": slug,
-                    }
-
-        # Build the final market list from nearest markets only
         final_market_ids = set()
-        for asset, market_info in nearest_by_asset.items():
-            market_id = market_info["market_id"]
-            up_token = market_info["up_token"]
-            down_token = market_info["down_token"]
+
+        for asset in assets:
+            # Construct the expected slug
+            slug = f"{asset}-updown-15m-{target_slot}"
+
+            try:
+                response = await self._http.get(
+                    f"{config.gamma_host}/events",
+                    params={"slug": slug}
+                )
+                events = response.json()
+            except Exception as e:
+                print(f"[Monitor] Failed to fetch {slug}: {e}")
+                continue
+
+            if not events:
+                print(f"[Monitor] {asset.upper()}: No market found for slot {target_slot}")
+                continue
+
+            event = events[0]
+            markets = event.get("markets", [])
+
+            if not markets:
+                print(f"[Monitor] {asset.upper()}: No market data in event")
+                continue
+
+            market = markets[0]
+
+            # Check if market is accepting orders
+            if market.get("closed"):
+                print(f"[Monitor] {asset.upper()}: Market closed")
+                continue
+
+            if not market.get("acceptingOrders", False):
+                print(f"[Monitor] {asset.upper()}: Not accepting orders")
+                continue
+
+            market_id = market.get("conditionId", "")
+            if not market_id:
+                continue
+
+            # Get token IDs
+            clob_ids = market.get("clobTokenIds")
+            if isinstance(clob_ids, str):
+                try:
+                    clob_ids = json.loads(clob_ids)
+                except:
+                    continue
+
+            if not clob_ids or len(clob_ids) < 2:
+                continue
+
+            up_token = clob_ids[0]
+            down_token = clob_ids[1]
 
             final_market_ids.add(market_id)
             new_token_map[up_token] = (market_id, "up")
@@ -654,16 +621,15 @@ class SpreadMonitor:
             # Create or update market state
             if market_id not in self._markets:
                 self._markets[market_id] = MarketState(
-                    asset=asset,
+                    asset=asset.upper(),
                     market_id=market_id,
                     timeframe="15m",
                     up_token=up_token,
                     down_token=down_token,
                 )
 
-            resolution_time = datetime.fromtimestamp(market_info["resolution_ts"], tz=timezone.utc)
-            time_until = (market_info["resolution_ts"] - now_ts) // 60
-            print(f"[Monitor] {asset}: {market_info['slug'][:50]}... resolves in {time_until}min")
+            time_until = (target_slot - now_ts) // 60
+            print(f"[Monitor] {asset.upper()}: {slug} resolves in {time_until}min")
 
         # Update token map
         self._token_to_market = new_token_map
@@ -672,24 +638,6 @@ class SpreadMonitor:
         stale = [mid for mid in self._markets if mid not in final_market_ids]
         for mid in stale:
             self._markets.pop(mid, None)
-
-        # Debug output
-        print(f"[Monitor] Found {crypto_15m_count} crypto 15m events in API response")
-
-        if len(self._markets) == 0 and nearest_by_asset:
-            # Markets exist but none are within our active window
-            nearest_ts = min(info["resolution_ts"] for info in nearest_by_asset.values())
-            time_until = (nearest_ts - now_ts) // 60
-            next_time = datetime.fromtimestamp(nearest_ts, tz=timezone.utc)
-            print(f"[Monitor] MARKETS CLOSED - Next market at {next_time.strftime('%H:%M')} UTC ({time_until} min)")
-        elif len(self._markets) == 0:
-            # No 15m markets found at all
-            if sample_slugs:
-                print(f"[Monitor] Sample crypto slugs found (no 15m):")
-                for s in sample_slugs[:3]:
-                    print(f"  - {s}")
-            else:
-                print(f"[Monitor] WARNING: No crypto-related events found in {total_events} events")
 
         print(f"[Monitor] Active markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
 
@@ -751,19 +699,14 @@ class SpreadMonitor:
             if m.opportunity_start is not None
         )
 
-        # Determine if markets are closed (no active markets)
-        markets_closed = len(self._markets) == 0
-
         return {
             "running": self._running,
             "connected": self._connected,
             "markets_tracked": len(self._markets),
-            "markets_closed": markets_closed,
             "messages_received": self._messages_received,
             "snapshots_recorded": self._snapshots_recorded,
             "opportunities_detected": self._opportunities_detected,
             "active_opportunities": active_opps,
-            "trading_hours": "6:15 PM - 1:15 AM EST",
         }
 
     def get_current_spreads(self) -> list[dict]:
