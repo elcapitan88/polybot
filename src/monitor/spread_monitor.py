@@ -562,14 +562,31 @@ class SpreadMonitor:
         # Track nearest upcoming market per asset
         nearest_by_asset: dict[str, dict] = {}
 
+        # Debug counters
+        total_events = len(events) if isinstance(events, list) else 0
+        crypto_15m_count = 0
+        sample_slugs = []
+
+        print(f"[Monitor] Fetched {total_events} total events from gamma API")
+
         for event in events:
             slug = (event.get("slug", "") or "").lower()
 
-            # Only 15m crypto up/down markets
-            if "-15m-" not in slug:
+            # Collect sample slugs for debugging (first 10 that contain crypto keywords)
+            if any(asset in slug for asset in ["btc", "eth", "xrp", "sol", "crypto"]):
+                if len(sample_slugs) < 10:
+                    sample_slugs.append(slug[:80])
+
+            # Check for 15m markets - be more flexible with the pattern
+            is_15m = "15m" in slug or "15-min" in slug or "15min" in slug
+
+            if not is_15m:
                 continue
+
             if not any(asset in slug for asset in ["btc", "eth", "xrp", "sol"]):
                 continue
+
+            crypto_15m_count += 1
 
             # Extract resolution timestamp from slug
             resolution_ts = self._extract_resolution_timestamp(slug)
@@ -656,6 +673,15 @@ class SpreadMonitor:
         for mid in stale:
             self._markets.pop(mid, None)
 
+        # Debug output
+        if sample_slugs:
+            print(f"[Monitor] Sample crypto-related slugs found:")
+            for s in sample_slugs[:5]:
+                print(f"  - {s}")
+        else:
+            print(f"[Monitor] WARNING: No crypto-related slugs found in {total_events} events")
+
+        print(f"[Monitor] Found {crypto_15m_count} crypto 15m events")
         print(f"[Monitor] Active markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
 
     async def _snapshot_loop(self):
