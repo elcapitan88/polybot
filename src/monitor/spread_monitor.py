@@ -674,14 +674,23 @@ class SpreadMonitor:
             self._markets.pop(mid, None)
 
         # Debug output
-        if sample_slugs:
-            print(f"[Monitor] Sample crypto-related slugs found:")
-            for s in sample_slugs[:5]:
-                print(f"  - {s}")
-        else:
-            print(f"[Monitor] WARNING: No crypto-related slugs found in {total_events} events")
+        print(f"[Monitor] Found {crypto_15m_count} crypto 15m events in API response")
 
-        print(f"[Monitor] Found {crypto_15m_count} crypto 15m events")
+        if len(self._markets) == 0 and nearest_by_asset:
+            # Markets exist but none are within our active window
+            nearest_ts = min(info["resolution_ts"] for info in nearest_by_asset.values())
+            time_until = (nearest_ts - now_ts) // 60
+            next_time = datetime.fromtimestamp(nearest_ts, tz=timezone.utc)
+            print(f"[Monitor] MARKETS CLOSED - Next market at {next_time.strftime('%H:%M')} UTC ({time_until} min)")
+        elif len(self._markets) == 0:
+            # No 15m markets found at all
+            if sample_slugs:
+                print(f"[Monitor] Sample crypto slugs found (no 15m):")
+                for s in sample_slugs[:3]:
+                    print(f"  - {s}")
+            else:
+                print(f"[Monitor] WARNING: No crypto-related events found in {total_events} events")
+
         print(f"[Monitor] Active markets: {len(self._markets)} ({len(self._token_to_market)} tokens)")
 
     async def _snapshot_loop(self):
@@ -742,14 +751,19 @@ class SpreadMonitor:
             if m.opportunity_start is not None
         )
 
+        # Determine if markets are closed (no active markets)
+        markets_closed = len(self._markets) == 0
+
         return {
             "running": self._running,
             "connected": self._connected,
             "markets_tracked": len(self._markets),
+            "markets_closed": markets_closed,
             "messages_received": self._messages_received,
             "snapshots_recorded": self._snapshots_recorded,
             "opportunities_detected": self._opportunities_detected,
             "active_opportunities": active_opps,
+            "trading_hours": "6 PM - 12 AM EST (approx)",
         }
 
     def get_current_spreads(self) -> list[dict]:
