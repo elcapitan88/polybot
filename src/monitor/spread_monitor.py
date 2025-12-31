@@ -287,11 +287,14 @@ class SpreadMonitor:
                 messages = [messages]
 
             for msg in messages:
+                # Detect message type by keys present (not all messages have event_type)
                 event_type = msg.get("event_type")
 
-                if event_type == "book":
+                if event_type == "book" or "bids" in msg or "asks" in msg:
+                    # Order book snapshot (has bids/asks arrays)
                     await self._handle_book_message(msg)
-                elif event_type == "price_change":
+                elif event_type == "price_change" or "price_changes" in msg:
+                    # Price change event (has price_changes array)
                     await self._handle_price_change(msg)
                 elif event_type == "last_trade_price":
                     await self._handle_last_trade(msg)
@@ -301,8 +304,8 @@ class SpreadMonitor:
                     # Known but not needed event types
                     pass
                 elif self._messages_received <= 10:
-                    # Log unknown event types for debugging
-                    print(f"[WS] Unknown event_type: {event_type}, keys: {list(msg.keys())}")
+                    # Log unknown message types for debugging
+                    print(f"[WS] Unknown message, keys: {list(msg.keys())}")
 
         except json.JSONDecodeError:
             print(f"[WS] JSON decode error on: {raw_message[:100]}")
@@ -313,16 +316,27 @@ class SpreadMonitor:
         """Handle full order book update."""
         asset_id = msg.get("asset_id")
         if not asset_id:
+            # Debug: log book messages without asset_id
+            if self._messages_received <= 10:
+                print(f"[WS] Book message missing asset_id, keys: {list(msg.keys())}")
             return
 
         market_info = self._token_to_market.get(asset_id)
         if not market_info:
+            if self._messages_received <= 10:
+                print(f"[WS] Book token not in map: {asset_id[:30]}...")
             return
 
         market_id, side = market_info
         market = self._markets.get(market_id)
         if not market:
             return
+
+        # Debug: log what we got
+        if self._messages_received <= 10:
+            bids_count = len(msg.get("bids", []))
+            asks_count = len(msg.get("asks", []))
+            print(f"[WS] Book for {market.asset} {side}: {bids_count} bids, {asks_count} asks")
 
         # Get best ask (lowest sell price) from asks array (NOT sells!)
         asks = msg.get("asks", [])
@@ -355,6 +369,11 @@ class SpreadMonitor:
         # Price changes include best bid/ask updates
         # Format: {"event_type": "price_change", "market": "...", "price_changes": [...]}
         price_changes = msg.get("price_changes", [])
+
+        # Debug: log first few price changes to trace the issue
+        if self._messages_received <= 20:
+            print(f"[WS] Processing price_changes: {len(price_changes)} changes")
+
         for change in price_changes:
             asset_id = change.get("asset_id")
             if not asset_id:
@@ -362,6 +381,9 @@ class SpreadMonitor:
 
             market_info = self._token_to_market.get(asset_id)
             if not market_info:
+                # Debug: log unmatched token IDs
+                if self._messages_received <= 20:
+                    print(f"[WS] Token not in map: {asset_id[:30]}... (map has {len(self._token_to_market)} tokens)")
                 continue
 
             market_id, side = market_info
@@ -373,6 +395,10 @@ class SpreadMonitor:
             best_ask_str = change.get("best_ask")
             now = datetime.now(timezone.utc)
 
+            # Debug: log matched tokens and what data we got
+            if self._messages_received <= 20:
+                print(f"[WS] MATCH! {market.asset} {side} | best_ask={best_ask_str} | keys: {list(change.keys())}")
+
             if best_ask_str:
                 best_ask = float(best_ask_str)
                 if side == "up":
@@ -381,6 +407,12 @@ class SpreadMonitor:
                 else:
                     market.down_ask = best_ask
                     market.down_updated = now
+
+                # Debug: log price updates
+                if self._messages_received <= 30:
+                    combined = market.combined or 0
+                    print(f"[WS] PRICE UPDATE: {market.asset} {side}=${best_ask:.3f} | Combined=${combined:.3f}")
+
                 self._check_opportunity(market)
             elif change.get("side") == "SELL":
                 # Fallback: use the price from SELL side changes
