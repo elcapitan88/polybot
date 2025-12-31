@@ -204,11 +204,30 @@ class SpreadMonitor:
             # Start ping task
             ping_task = asyncio.create_task(self._ping_loop())
 
+            # Start a watchdog to check if we're receiving messages
+            watchdog_task = asyncio.create_task(self._message_watchdog())
+
             try:
                 async for message in ws:
                     await self._handle_message(message)
             finally:
                 ping_task.cancel()
+                watchdog_task.cancel()
+
+    async def _message_watchdog(self):
+        """Check if we're receiving messages, warn if not."""
+        await asyncio.sleep(15)  # Wait 15 seconds after connecting
+
+        if self._messages_received == 0:
+            print("[WS] WARNING: No messages received after 15 seconds!")
+            print("[WS] This likely means the subscription format is incorrect or tokens are invalid")
+            print(f"[WS] Token map has {len(self._token_to_market)} tokens")
+
+            # Print token IDs for debugging
+            for token_id, (market_id, side) in list(self._token_to_market.items())[:4]:
+                print(f"[WS]   Token: {token_id[:30]}... -> {side}")
+        else:
+            print(f"[WS] Watchdog OK: Received {self._messages_received} messages so far")
 
     async def _ping_loop(self):
         """Send PING messages to keep connection alive."""
@@ -231,18 +250,22 @@ class SpreadMonitor:
         for market in self._markets.values():
             asset_ids.append(market.up_token)
             asset_ids.append(market.down_token)
+            print(f"[WS] Token {market.asset}: UP={market.up_token[:20]}... DOWN={market.down_token[:20]}...")
 
         if not asset_ids:
             print("[WS] No tokens to subscribe to")
             return
 
         # Send subscription message
+        # According to Polymarket CLOB docs, the format is:
         subscribe_msg = {
             "assets_ids": asset_ids,
             "type": "market"
         }
 
-        await self._ws.send(json.dumps(subscribe_msg))
+        msg_str = json.dumps(subscribe_msg)
+        print(f"[WS] Sending subscription: {msg_str[:200]}...")
+        await self._ws.send(msg_str)
         print(f"[WS] Subscribed to {len(asset_ids)} tokens ({len(self._markets)} markets)")
 
     async def _handle_message(self, raw_message: str):
@@ -251,6 +274,11 @@ class SpreadMonitor:
             return
 
         self._messages_received += 1
+
+        # Log first few messages and then periodically
+        if self._messages_received <= 5 or self._messages_received % 50 == 0:
+            preview = raw_message[:300] if len(raw_message) > 300 else raw_message
+            print(f"[WS] Message #{self._messages_received}: {preview}")
 
         try:
             # Messages can be arrays
@@ -267,9 +295,17 @@ class SpreadMonitor:
                     await self._handle_price_change(msg)
                 elif event_type == "last_trade_price":
                     await self._handle_last_trade(msg)
+                elif event_type == "best_bid_ask":
+                    await self._handle_best_bid_ask(msg)
+                elif event_type in ("tick_size_change", "new_market", "market_resolved"):
+                    # Known but not needed event types
+                    pass
+                elif self._messages_received <= 10:
+                    # Log unknown event types for debugging
+                    print(f"[WS] Unknown event_type: {event_type}, keys: {list(msg.keys())}")
 
         except json.JSONDecodeError:
-            pass
+            print(f"[WS] JSON decode error on: {raw_message[:100]}")
         except Exception as e:
             print(f"[WS] Message handling error: {e}")
 
@@ -288,12 +324,12 @@ class SpreadMonitor:
         if not market:
             return
 
-        # Get best ask (lowest sell price) from sells array
-        sells = msg.get("sells", [])
-        if sells:
-            # Sells are typically sorted by price ascending
-            best_ask = float(sells[0].get("price", 0))
-            best_ask_size = float(sells[0].get("size", 0))
+        # Get best ask (lowest sell price) from asks array (NOT sells!)
+        asks = msg.get("asks", [])
+        if asks:
+            # Asks are typically sorted by price ascending (lowest first)
+            best_ask = float(asks[0].get("price", 0))
+            best_ask_size = float(asks[0].get("size", 0))
 
             now = datetime.now(timezone.utc)
 
@@ -317,8 +353,9 @@ class SpreadMonitor:
     async def _handle_price_change(self, msg: dict):
         """Handle price change update."""
         # Price changes include best bid/ask updates
-        changes = msg.get("changes", [])
-        for change in changes:
+        # Format: {"event_type": "price_change", "market": "...", "price_changes": [...]}
+        price_changes = msg.get("price_changes", [])
+        for change in price_changes:
             asset_id = change.get("asset_id")
             if not asset_id:
                 continue
@@ -332,14 +369,24 @@ class SpreadMonitor:
             if not market:
                 continue
 
-            # Check if this is an ask (sell) side update
-            if change.get("side") == "SELL":
+            # Use best_ask directly if available, otherwise use price for SELL side
+            best_ask_str = change.get("best_ask")
+            now = datetime.now(timezone.utc)
+
+            if best_ask_str:
+                best_ask = float(best_ask_str)
+                if side == "up":
+                    market.up_ask = best_ask
+                    market.up_updated = now
+                else:
+                    market.down_ask = best_ask
+                    market.down_updated = now
+                self._check_opportunity(market)
+            elif change.get("side") == "SELL":
+                # Fallback: use the price from SELL side changes
                 price = float(change.get("price", 0))
                 size = float(change.get("size", 0))
-                now = datetime.now(timezone.utc)
 
-                # Only update if this could be the new best ask
-                # (We'd need the full book to know for sure, but we can use this as a hint)
                 if side == "up":
                     if market.up_ask is None or price <= market.up_ask:
                         market.up_ask = price
@@ -378,6 +425,37 @@ class SpreadMonitor:
         elif side == "down" and market.down_ask is None:
             market.down_ask = price
             market.down_updated = now
+
+    async def _handle_best_bid_ask(self, msg: dict):
+        """Handle best bid/ask update - most efficient for tracking spreads."""
+        asset_id = msg.get("asset_id")
+        if not asset_id:
+            return
+
+        market_info = self._token_to_market.get(asset_id)
+        if not market_info:
+            return
+
+        market_id, side = market_info
+        market = self._markets.get(market_id)
+        if not market:
+            return
+
+        best_ask_str = msg.get("best_ask")
+        if not best_ask_str:
+            return
+
+        best_ask = float(best_ask_str)
+        now = datetime.now(timezone.utc)
+
+        if side == "up":
+            market.up_ask = best_ask
+            market.up_updated = now
+        else:
+            market.down_ask = best_ask
+            market.down_updated = now
+
+        self._check_opportunity(market)
 
     def _check_opportunity(self, market: MarketState):
         """Check if market has an opportunity and handle it."""
@@ -617,6 +695,9 @@ class SpreadMonitor:
             final_market_ids.add(market_id)
             new_token_map[up_token] = (market_id, "up")
             new_token_map[down_token] = (market_id, "down")
+
+            # Debug: print token IDs
+            print(f"[Monitor] {asset.upper()} tokens: UP={up_token[:40]}... DOWN={down_token[:40]}...")
 
             # Create or update market state
             if market_id not in self._markets:
