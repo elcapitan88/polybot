@@ -215,7 +215,7 @@ class SpreadMonitor:
         while self._running and self._ws:
             try:
                 await asyncio.sleep(self.WS_PING_INTERVAL)
-                if self._ws and self._ws.open:
+                if self._ws:
                     await self._ws.send("PING")
             except Exception as e:
                 print(f"[WS] Ping error: {e}")
@@ -500,7 +500,7 @@ class SpreadMonitor:
                     new_count = len(self._markets)
 
                     # Resubscribe if markets changed
-                    if new_count != old_count and self._ws and self._ws.open:
+                    if new_count != old_count and self._ws:
                         await self._subscribe_all_tokens()
 
                     self._last_market_refresh = now
@@ -535,7 +535,7 @@ class SpreadMonitor:
         return None
 
     async def _refresh_markets(self):
-        """Fetch only the currently active 15m market for each asset."""
+        """Fetch the nearest upcoming 15m market for each asset."""
         print("[Monitor] Refreshing markets...")
 
         if not self._http:
@@ -556,15 +556,11 @@ class SpreadMonitor:
             print(f"[Monitor] Failed to fetch events: {e}")
             return
 
-        # Calculate the next resolution time
-        next_resolution = self._get_next_resolution_time()
-        next_resolution_ts = int(next_resolution.timestamp())
-
-        print(f"[Monitor] Looking for markets resolving at {next_resolution.strftime('%H:%M:%S')} UTC (ts={next_resolution_ts})")
-
+        now_ts = int(datetime.now(timezone.utc).timestamp())
         seen_market_ids = set()
         new_token_map = {}
-        active_by_asset = {}  # asset -> best matching market
+        # Track nearest upcoming market per asset
+        nearest_by_asset: dict[str, dict] = {}
 
         for event in events:
             slug = (event.get("slug", "") or "").lower()
@@ -578,11 +574,11 @@ class SpreadMonitor:
             # Extract resolution timestamp from slug
             resolution_ts = self._extract_resolution_timestamp(slug)
             if resolution_ts is None:
+                print(f"[Monitor] Could not parse timestamp from: {slug}")
                 continue
 
-            # Only include markets that resolve at the next 15-minute mark
-            # Allow a small tolerance (within 60 seconds)
-            if abs(resolution_ts - next_resolution_ts) > 60:
+            # Skip markets that resolved more than 5 minutes ago
+            if resolution_ts < now_ts - 300:
                 continue
 
             # Extract asset
@@ -617,17 +613,19 @@ class SpreadMonitor:
                 up_token = clob_ids[0]
                 down_token = clob_ids[1]
 
-                # Store this as the active market for this asset
-                active_by_asset[asset] = {
-                    "market_id": market_id,
-                    "up_token": up_token,
-                    "down_token": down_token,
-                    "resolution_ts": resolution_ts,
-                }
+                # Keep only the nearest (soonest resolving) market per asset
+                if asset not in nearest_by_asset or resolution_ts < nearest_by_asset[asset]["resolution_ts"]:
+                    nearest_by_asset[asset] = {
+                        "market_id": market_id,
+                        "up_token": up_token,
+                        "down_token": down_token,
+                        "resolution_ts": resolution_ts,
+                        "slug": slug,
+                    }
 
-        # Build the final market list from active markets only
+        # Build the final market list from nearest markets only
         final_market_ids = set()
-        for asset, market_info in active_by_asset.items():
+        for asset, market_info in nearest_by_asset.items():
             market_id = market_info["market_id"]
             up_token = market_info["up_token"]
             down_token = market_info["down_token"]
@@ -647,7 +645,8 @@ class SpreadMonitor:
                 )
 
             resolution_time = datetime.fromtimestamp(market_info["resolution_ts"], tz=timezone.utc)
-            print(f"[Monitor] {asset}: Tracking market resolving at {resolution_time.strftime('%H:%M:%S')} UTC")
+            time_until = (market_info["resolution_ts"] - now_ts) // 60
+            print(f"[Monitor] {asset}: {market_info['slug'][:50]}... resolves in {time_until}min")
 
         # Update token map
         self._token_to_market = new_token_map
