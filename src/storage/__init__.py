@@ -1,5 +1,5 @@
-"""Storage layer for Polymarket data."""
+"""Storage layer for Polymarket spread monitoring data."""
 
-from src.storage.postgres import PostgresStorage
+from src.storage.postgres import Storage
 
-__all__ = ["PostgresStorage"]
+__all__ = ["Storage"]

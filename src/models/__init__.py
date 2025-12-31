@@ -1,21 +1,21 @@
-"""Database models for Polymarket data."""
+"""Database models for Polymarket spread monitoring."""
 
 from src.models.database import (
     Base,
-    PriceTick,
-    MarketSession,
-    ArbitrageOpportunity,
-    CheapPrice,
-    CollectorStats,
+    SpreadSnapshot,
+    Opportunity,
+    MarketWindow,
+    DailyStats,
+    MonitorStatus,
     init_db,
 )
 
 __all__ = [
     "Base",
-    "PriceTick",
-    "MarketSession",
-    "ArbitrageOpportunity",
-    "CheapPrice",
-    "CollectorStats",
+    "SpreadSnapshot",
+    "Opportunity",
+    "MarketWindow",
+    "DailyStats",
+    "MonitorStatus",
     "init_db",
 ]

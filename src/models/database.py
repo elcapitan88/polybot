@@ -1,9 +1,15 @@
-"""SQLAlchemy database models for Polymarket data collection."""
+"""SQLAlchemy database models for Polymarket spread monitoring.
+
+Designed for the Jane Street delta-neutral strategy:
+- Track when combined UP + DOWN < $1.00 (opportunity)
+- Monitor spread frequency, duration, and size
+- Store historical data for pattern analysis
+"""
 
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, DateTime, Text,
-    create_engine, Index
+    Column, Integer, String, Float, Boolean, DateTime,
+    create_engine, Index, BigInteger
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -11,136 +17,164 @@ from sqlalchemy.orm import sessionmaker
 Base = declarative_base()
 
 
-class PriceTick(Base):
-    """Individual price observation for a market."""
-    __tablename__ = "price_ticks"
+class SpreadSnapshot(Base):
+    """
+    Periodic snapshot of market spreads.
+    Stored every 30 seconds for historical analysis.
+    """
+    __tablename__ = "spread_snapshots"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, nullable=False, index=True)
-    market_id = Column(String(100), nullable=False, index=True)
-    asset = Column(String(10), nullable=False, index=True)
-    question = Column(Text)
 
-    yes_ask = Column(Float)
-    no_ask = Column(Float)
-    combined_cost = Column(Float)
-    profit_pct = Column(Float)
+    # Market identification
+    asset = Column(String(10), nullable=False, index=True)  # BTC, ETH, SOL, XRP
+    market_id = Column(String(100), nullable=False)
 
-    yes_liquidity = Column(Float)
-    no_liquidity = Column(Float)
+    # Prices (what you pay to BUY each side)
+    up_ask = Column(Float)      # Price to buy UP (YES)
+    down_ask = Column(Float)    # Price to buy DOWN (NO)
+    combined = Column(Float)    # up_ask + down_ask
+    spread = Column(Float)      # 1.0 - combined (positive = profit opportunity)
 
-    has_arbitrage = Column(Boolean, default=False, index=True)
-    is_cheap_yes = Column(Boolean, default=False)
-    is_cheap_no = Column(Boolean, default=False)
+    # Liquidity available at best ask
+    up_liquidity = Column(Float)
+    down_liquidity = Column(Float)
+
+    # Flags
+    has_opportunity = Column(Boolean, default=False, index=True)  # combined < 1.0
 
     __table_args__ = (
-        Index('ix_price_ticks_asset_timestamp', 'asset', 'timestamp'),
-        Index('ix_price_ticks_market_timestamp', 'market_id', 'timestamp'),
+        Index('ix_snapshots_asset_ts', 'asset', 'timestamp'),
+        Index('ix_snapshots_opportunity', 'has_opportunity', 'timestamp'),
     )
 
 
-class MarketSession(Base):
-    """Tracks a market session from open to close."""
-    __tablename__ = "market_sessions"
+class Opportunity(Base):
+    """
+    Recorded when combined < $1.00 - these are the money moments.
+    Tracks full lifecycle: detection -> resolution.
+    """
+    __tablename__ = "opportunities"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    market_id = Column(String(100), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # When detected
+    detected_at = Column(DateTime, nullable=False, index=True)
+
+    # Market info
     asset = Column(String(10), nullable=False, index=True)
-    question = Column(Text)
+    market_id = Column(String(100), nullable=False)
 
-    # Opening prices
-    open_time = Column(DateTime, index=True)
-    yes_open = Column(Float)
-    no_open = Column(Float)
+    # Prices at detection
+    up_ask = Column(Float, nullable=False)
+    down_ask = Column(Float, nullable=False)
+    combined = Column(Float, nullable=False)
+    spread = Column(Float, nullable=False)  # 1.0 - combined
+    spread_pct = Column(Float, nullable=False)  # (spread / combined) * 100
 
-    # Closing prices
-    close_time = Column(DateTime)
-    yes_close = Column(Float)
-    no_close = Column(Float)
+    # Liquidity at detection
+    up_liquidity = Column(Float)
+    down_liquidity = Column(Float)
+    max_position = Column(Float)  # min(up_liq, down_liq) - max you could trade
 
-    # Price extremes
-    yes_high = Column(Float)
-    yes_low = Column(Float)
-    no_high = Column(Float)
-    no_low = Column(Float)
+    # Lifecycle tracking
+    resolved_at = Column(DateTime)  # When spread closed (combined >= 1.0)
+    duration_seconds = Column(Float)  # How long opportunity lasted
 
-    # Analysis results
-    yes_closed_above_open = Column(Boolean)
-    no_closed_below_open = Column(Boolean)
-    yes_price_change = Column(Float)
-    no_price_change = Column(Float)
-
-    # Stats
-    observation_count = Column(Integer, default=0)
-    arbitrage_opportunities = Column(Integer, default=0)
-    cheap_price_hits = Column(Integer, default=0)
+    # Best prices during opportunity
+    best_spread = Column(Float)  # Maximum spread seen
+    best_spread_pct = Column(Float)
 
     __table_args__ = (
-        Index('ix_sessions_asset_open', 'asset', 'open_time'),
+        Index('ix_opp_asset_detected', 'asset', 'detected_at'),
+        Index('ix_opp_spread', 'spread_pct'),
     )
 
 
-class ArbitrageOpportunity(Base):
-    """Recorded arbitrage opportunity."""
-    __tablename__ = "arbitrage_opportunities"
+class MarketWindow(Base):
+    """
+    Summary stats for each 5m/15m market window.
+    Useful for understanding when opportunities occur.
+    """
+    __tablename__ = "market_windows"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, nullable=False, index=True)
-    market_id = Column(String(100), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Window identification
     asset = Column(String(10), nullable=False, index=True)
-    question = Column(Text)
+    timeframe = Column(String(5), nullable=False)  # "5m" or "15m"
+    market_id = Column(String(100), nullable=False)
 
-    yes_ask = Column(Float)
-    no_ask = Column(Float)
-    combined_cost = Column(Float)
-    profit_pct = Column(Float)
-
-    yes_liquidity = Column(Float)
-    no_liquidity = Column(Float)
-    max_profit_usd = Column(Float)
-
-    __table_args__ = (
-        Index('ix_arb_asset_timestamp', 'asset', 'timestamp'),
-        Index('ix_arb_profit', 'profit_pct'),
-    )
-
-
-class CheapPrice(Base):
-    """Recorded cheap price occurrence."""
-    __tablename__ = "cheap_prices"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, nullable=False, index=True)
-    market_id = Column(String(100), nullable=False, index=True)
-    asset = Column(String(10), nullable=False, index=True)
-
-    side = Column(String(5), nullable=False)  # YES or NO
-    price = Column(Float, nullable=False, index=True)
-    threshold = Column(Float)
-    liquidity = Column(Float)
-
-    __table_args__ = (
-        Index('ix_cheap_asset_timestamp', 'asset', 'timestamp'),
-        Index('ix_cheap_side_price', 'side', 'price'),
-    )
-
-
-class CollectorStats(Base):
-    """Running stats for the collector."""
-    __tablename__ = "collector_stats"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    start_time = Column(DateTime, nullable=False)
+    # Time bounds
+    start_time = Column(DateTime, nullable=False, index=True)
     end_time = Column(DateTime)
 
-    total_scans = Column(Integer, default=0)
-    total_opportunities = Column(Integer, default=0)
-    total_cheap_prices = Column(Integer, default=0)
-    total_sessions = Column(Integer, default=0)
+    # Spread stats during window
+    min_combined = Column(Float)  # Lowest combined cost seen
+    max_spread = Column(Float)    # Best spread seen
+    avg_combined = Column(Float)  # Average combined cost
 
-    interval_ms = Column(Integer)
-    cheap_threshold = Column(Float)
-    arbitrage_threshold = Column(Float)
+    # Opportunity stats
+    opportunity_count = Column(Integer, default=0)  # Times combined < $1.00
+    total_opportunity_seconds = Column(Float, default=0)  # Total time with opportunity
+
+    # Snapshot count
+    snapshot_count = Column(Integer, default=0)
+
+    __table_args__ = (
+        Index('ix_window_asset_start', 'asset', 'start_time'),
+    )
+
+
+class DailyStats(Base):
+    """
+    Daily aggregated statistics for reporting.
+    """
+    __tablename__ = "daily_stats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(DateTime, nullable=False, unique=True, index=True)
+
+    # Opportunity counts
+    total_opportunities = Column(Integer, default=0)
+    btc_opportunities = Column(Integer, default=0)
+    eth_opportunities = Column(Integer, default=0)
+    sol_opportunities = Column(Integer, default=0)
+    xrp_opportunities = Column(Integer, default=0)
+
+    # Best spreads seen
+    best_spread_pct = Column(Float)
+    avg_spread_pct = Column(Float)
+
+    # Time stats
+    total_opportunity_seconds = Column(Float, default=0)
+    longest_opportunity_seconds = Column(Float)
+
+    # If we had traded (theoretical)
+    theoretical_profit_usd = Column(Float)  # Based on $100 per opportunity
+
+
+class MonitorStatus(Base):
+    """
+    Current monitor status and health.
+    """
+    __tablename__ = "monitor_status"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    started_at = Column(DateTime, nullable=False)
+    last_update = Column(DateTime)
+
+    # Connection status
+    websocket_connected = Column(Boolean, default=False)
+    subscribed_markets = Column(Integer, default=0)
+
+    # Stats since start
+    snapshots_recorded = Column(Integer, default=0)
+    opportunities_detected = Column(Integer, default=0)
+
+    # Current state
+    active_opportunities = Column(Integer, default=0)
 
 
 def init_db(database_url: str):
